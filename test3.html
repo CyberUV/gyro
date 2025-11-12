@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>3D Gyro Tracker — Light Theme</title>
+<style>
+  body { margin:0; font-family:system-ui,Segoe UI,Roboto,Arial; background:#fff; color:#111; }
+  #ui {
+    position: fixed; left: 12px; top: 12px; z-index: 999;
+    background: rgba(255,255,255,0.8); padding: 12px; border-radius: 10px;
+    backdrop-filter: blur(6px);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.2);
+  }
+  button { margin:4px; padding:8px 12px; border-radius:8px; border: none; cursor:pointer; font-weight:600;}
+  button.primary { background: #18a; color:#fff; }
+  button.warn { background:#d64; color:#fff; }
+  .small { font-size:13px; opacity:0.9; margin-top:6px; }
+  #log { margin-top:8px; font-family: monospace; font-size:12px; color:#111; }
+  #canvas { display:block; width:100vw; height:100vh; }
+  select, label, input { font-size:13px; }
+  input { padding:6px 8px; border-radius:6px; border:1px solid #aaa; flex:1; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+    <input type="text" id="labelInput" placeholder="Enter gesture label" />
+    <button id="btnStart" class="primary">Start</button>
+    <button id="btnStop">Stop</button>
+    <button id="btnRecord">Start Recording</button>
+    <button id="btnDownload" style="display:none">Download CSV</button>
+    <button id="btnPlay" style="display:none">Play</button>
+  </div>
+  <div class="small">Mode:
+    <select id="modeSelect">
+      <option value="orient">Use deviceorientation (angles)</option>
+      <option value="rates">Use rotationRate (devicemotion)</option>
+    </select>
+  </div>
+  <div id="log">
+    <div>Status: <span id="status">idle</span></div>
+    <div>Source: <span id="source">—</span></div>
+    <div>Angles α/β/γ: <span id="angles">— / — / —</span></div>
+    <div>rotationRate (deg/s): <span id="rates">— / — / —</span></div>
+    <div>Recorded rows: <span id="rows">0</span></div>
+    <div>Current Label: <span id="currentLabel">—</span></div>
+  </div>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<script src="https://unpkg.com/three@0.150.1/build/three.min.js"></script>
+
+<script>
+(() => {
+  const btnStart = document.getElementById('btnStart');
+  const btnStop  = document.getElementById('btnStop');
+  const btnRecord = document.getElementById('btnRecord');
+  const btnDownload = document.getElementById('btnDownload');
+  const btnPlay = document.getElementById('btnPlay');
+  const statusEl = document.getElementById('status');
+  const sourceEl = document.getElementById('source');
+  const anglesEl = document.getElementById('angles');
+  const ratesEl = document.getElementById('rates');
+  const rowsEl = document.getElementById('rows');
+  const modeSelect = document.getElementById('modeSelect');
+  const labelInput = document.getElementById('labelInput');
+  const currentLabelEl = document.getElementById('currentLabel');
+
+  let running = false;
+  let recording = false;
+  let recorded = [];
+  let lastTs = null;
+
+  // Update current label display
+  labelInput.addEventListener('input', ()=> {
+    currentLabelEl.textContent = labelInput.value || '—';
+  });
+
+  // THREE.js setup
+  const canvas = document.getElementById('canvas');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+  renderer.setClearColor(0xffffff);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight,0.1,2000);
+  camera.position.set(0,0,6);
+
+  const light = new THREE.DirectionalLight(0xffffff,1.0);
+  light.position.set(5,10,7);
+  scene.add(light);
+  scene.add(new THREE.AmbientLight(0xcccccc,0.8));
+
+  // Phone model
+  const phone = new THREE.Group();
+
+  // Body
+  const bodyGeom = new THREE.BoxGeometry(2.2,4.6,0.2);
+  const bodyMat = new THREE.MeshStandardMaterial({color:0x000000, metalness:0.4, roughness:0.6});
+  const body = new THREE.Mesh(bodyGeom, bodyMat);
+  phone.add(body);
+
+  // Screen
+  const screenGeom = new THREE.PlaneGeometry(1.9,4.0);
+  const screenMat = new THREE.MeshStandardMaterial({color:0x111111, emissive:0x222222, emissiveIntensity:0.4});
+  const screen = new THREE.Mesh(screenGeom, screenMat);
+  screen.position.z = 0.101;
+  phone.add(screen);
+
+  // Front camera
+  const fcGeom = new THREE.SphereGeometry(0.07,16,16);
+  const fcMat = new THREE.MeshStandardMaterial({color:0x555555, metalness:0.8, roughness:0.3});
+  const frontCam = new THREE.Mesh(fcGeom, fcMat);
+  frontCam.position.set(0,2.15,0.12);
+  phone.add(frontCam);
+
+  // Rear cameras (3)
+  const rearCamGeom = new THREE.CylinderGeometry(0.1,0.1,0.05,16);
+  const rearCamMat = new THREE.MeshStandardMaterial({color:0x222222, metalness:0.7, roughness:0.3});
+  const positions = [[0.8,-2.0,0.11],[0,-2.0,0.11],[-0.8,-2.0,0.11]];
+  positions.forEach(pos=>{
+    const c = new THREE.Mesh(rearCamGeom,rearCamMat);
+    c.position.set(...pos);
+    c.rotation.x = Math.PI/2;
+    phone.add(c);
+  });
+
+  scene.add(phone);
+
+  // Grid reference
+  const grid = new THREE.GridHelper(30,30,0xaaaaaa,0xdddddd);
+  grid.position.y=-6;
+  scene.add(grid);
+
+  // Resize
+  function resize(){ const w=window.innerWidth,h=window.innerHeight; renderer.setSize(w,h); camera.aspect=w/h; camera.updateProjectionMatrix(); }
+  window.addEventListener('resize',resize);
+  resize();
+
+  function eulerFromDevice(alpha,beta,gamma){
+    const _deg2rad=Math.PI/180;
+    const a=(alpha||0)*_deg2rad;
+    const b=(beta||0)*_deg2rad;
+    const g=(gamma||0)*_deg2rad;
+    const euler=new THREE.Euler();
+    euler.set(b,g,a,'ZXY');
+    return new THREE.Quaternion().setFromEuler(euler);
+  }
+
+  function animate(){ requestAnimationFrame(animate); renderer.render(scene,camera); }
+  animate();
+
+  function onDeviceOrientation(e){
+    const alpha=typeof e.alpha==='number'?e.alpha:NaN;
+    const beta=typeof e.beta==='number'?e.beta:NaN;
+    const gamma=typeof e.gamma==='number'?e.gamma:NaN;
+    const q = eulerFromDevice(alpha,beta,gamma);
+    phone.quaternion.copy(q);
+    anglesEl.textContent=`${alpha.toFixed(2)} / ${beta.toFixed(2)} / ${gamma.toFixed(2)}`;
+    if(recording){ 
+        recorded.push({
+            t: Date.now(), alpha, beta, gamma, rx:'', ry:'', rz:'', label: labelInput.value.trim() || 'undefined'
+        }); 
+        rowsEl.textContent=recorded.length; 
+    }
+  }
+
+  function onDeviceMotion(e){
+    const rr=e.rotationRate||{};
+    const rx=typeof rr.alpha==='number'?rr.alpha:0;
+    const ry=typeof rr.beta==='number'?rr.beta:0;
+    const rz=typeof rr.gamma==='number'?rr.gamma:0;
+    ratesEl.textContent=`${rx.toFixed(2)} / ${ry.toFixed(2)} / ${rz.toFixed(2)}`;
+    if(recording){ 
+        recorded.push({
+            t: Date.now(), alpha:'', beta:'', gamma:'', rx, ry, rz, label: labelInput.value.trim() || 'undefined'
+        }); 
+        rowsEl.textContent=recorded.length; 
+    }
+  }
+
+  async function requestPermissions(){
+    try{
+      if(typeof DeviceMotionEvent!=='undefined' && typeof DeviceMotionEvent.requestPermission==='function'){
+        const dm = await DeviceMotionEvent.requestPermission().catch(()=> 'denied');
+        const doPerm = (typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function')
+          ? await DeviceOrientationEvent.requestPermission().catch(()=> 'denied') : 'granted';
+        return dm==='granted' || doPerm==='granted';
+      }
+    }catch(err){ console.warn(err); }
+    return true;
+  }
+
+  async function startSensors(){
+    if(running) return;
+    statusEl.textContent='requesting permission...';
+    const ok=await requestPermissions();
+    if(!ok){ statusEl.textContent='permission denied'; return; }
+    window.addEventListener('deviceorientation',onDeviceOrientation,true);
+    window.addEventListener('devicemotion',onDeviceMotion,true);
+    running=true;
+    statusEl.textContent='running';
+    sourceEl.textContent='deviceorientation/devicemotion';
+  }
+
+  function stopSensors(){
+    if(!running) return;
+    window.removeEventListener('deviceorientation',onDeviceOrientation,true);
+    window.removeEventListener('devicemotion',onDeviceMotion,true);
+    running=false;
+    statusEl.textContent='stopped';
+    sourceEl.textContent='—';
+  }
+
+  btnStart.addEventListener('click',startSensors);
+  btnStop.addEventListener('click',stopSensors);
+
+  btnRecord.addEventListener('click',()=>{
+    const label = labelInput.value.trim() || 'undefined';
+    currentLabelEl.textContent = label;
+    if(!recording){
+        recorded=[]; 
+        recording=true; 
+        btnRecord.textContent='Stop Recording'; 
+        btnDownload.style.display='none'; 
+        rowsEl.textContent='0'; 
+        statusEl.textContent='running (recording)';
+    } else{
+        recording=false; 
+        btnRecord.textContent='Start Recording'; 
+        btnDownload.style.display=recorded.length?'inline-block':'none'; 
+        statusEl.textContent='running';
+    }
+  });
+
+  btnDownload.addEventListener('click',()=>{
+    if(!recorded.length) return alert('No data');
+    const header=['timestamp','alpha','beta','gamma','rx','ry','rz','label'];
+    const lines=recorded.map(r=>[new Date(r.t).toISOString(),r.alpha,r.beta,r.gamma,r.rx,r.ry,r.rz,r.label].join(','));
+    const csv=[header.join(','),...lines].join('\n');
+    const blob=new Blob([csv],{type:'text/csv'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download='gyro_recording_'+(new Date()).toISOString().replace(/[:.]/g,'-')+'.csv';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  });
+
+})();
+</script>
+</body>
+</html>
