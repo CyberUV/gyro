@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Gyroscope + Orientation Tracker</title>
+<style>
+body {
+  font-family: monospace;
+  background: #111;
+  color: #0f0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  margin: 0;
+  text-align: center;
+}
+button {
+  padding: 10px 20px;
+  font-size: 16px;
+  margin: 6px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  background: #0f0;
+  color: #000;
+  font-weight: bold;
+}
+#log {
+  margin-top: 10px;
+  width: 90%;
+  max-width: 400px;
+  background: rgba(0,255,0,0.1);
+  border: 1px solid #0f0;
+  padding: 10px;
+  border-radius: 8px;
+  overflow-y: auto;
+  font-size: 14px;
+  line-height: 1.3;
+}
+</style>
+</head>
+<body>
+<h2>📱 Gyroscope + Orientation Tracker</h2>
+<button id="startBtn">Start Tracking</button>
+<button id="stopBtn">Stop Tracking</button>
+<div id="log">
+  <div>Status: <span id="status">Idle</span></div>
+  <div>Angles α/β/γ (deg): <span id="angles">— / — / —</span></div>
+  <div>RotationRate (deg/s): <span id="rot">— / — / —</span></div>
+  <div>Integrated Orientation (deg): <span id="est">— / — / —</span></div>
+</div>
+
+<script>
+(() => {
+  const statusEl = document.getElementById("status");
+  const anglesEl = document.getElementById("angles");
+  const rotEl = document.getElementById("rot");
+  const estEl = document.getElementById("est");
+
+  const state = {
+    running: false,
+    lastTs: null,
+    integrated: { yaw: 0, pitch: 0, roll: 0 },
+  };
+
+  const f = (n, d=2) => (typeof n === "number" ? n.toFixed(d) : "—");
+  const normAngle = a => ((a + 180) % 360 + 360) % 360 - 180;
+
+  function integrateRotationRates(rx, ry, rz, dt) {
+    state.integrated.roll += rx * dt;
+    state.integrated.pitch += ry * dt;
+    state.integrated.yaw += rz * dt;
+  }
+
+  async function requestPermissions() {
+    // For iOS Safari
+    if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+      const r1 = await DeviceMotionEvent.requestPermission().catch(() => "denied");
+      const r2 = await DeviceOrientationEvent.requestPermission().catch(() => "denied");
+      return (r1 === "granted" || r2 === "granted");
+    }
+    // For Android Chrome (no explicit permission needed)
+    return true;
+  }
+
+  async function startTracking() {
+    if (state.running) return;
+    statusEl.textContent = "Requesting permission...";
+    const ok = await requestPermissions();
+    if (!ok) {
+      statusEl.textContent = "Permission denied ❌";
+      return;
+    }
+
+    state.running = true;
+    statusEl.textContent = "Running...";
+    state.lastTs = null;
+    state.integrated = { yaw: 0, pitch: 0, roll: 0 };
+
+    window.addEventListener("deviceorientation", onOrientation);
+    window.addEventListener("devicemotion", onMotion);
+  }
+
+  function stopTracking() {
+    if (!state.running) return;
+    state.running = false;
+    window.removeEventListener("deviceorientation", onOrientation);
+    window.removeEventListener("devicemotion", onMotion);
+    statusEl.textContent = "Stopped";
+  }
+
+  function onOrientation(e) {
+    const ts = performance.now();
+    const dt = state.lastTs ? (ts - state.lastTs) / 1000 : 0;
+    state.lastTs = ts;
+
+    const alpha = e.alpha ?? NaN;
+    const beta = e.beta ?? NaN;
+    const gamma = e.gamma ?? NaN;
+
+    anglesEl.textContent = `${f(alpha)} / ${f(beta)} / ${f(gamma)}`;
+
+    if (!isNaN(alpha)) state.integrated.yaw = alpha;
+    if (!isNaN(beta)) state.integrated.pitch = beta;
+    if (!isNaN(gamma)) state.integrated.roll = gamma;
+
+    estEl.textContent = `${f(normAngle(state.integrated.yaw))} / ${f(normAngle(state.integrated.pitch))} / ${f(normAngle(state.integrated.roll))}`;
+  }
+
+  function onMotion(e) {
+    const rr = e.rotationRate || {};
+    const rx = rr.alpha || 0;
+    const ry = rr.beta || 0;
+    const rz = rr.gamma || 0;
+
+    const ts = performance.now();
+    const dt = state.lastTs ? (ts - state.lastTs) / 1000 : 0;
+    state.lastTs = ts;
+
+    integrateRotationRates(rx, ry, rz, dt);
+    rotEl.textContent = `${f(rx)} / ${f(ry)} / ${f(rz)}`;
+    estEl.textContent = `${f(normAngle(state.integrated.yaw))} / ${f(normAngle(state.integrated.pitch))} / ${f(normAngle(state.integrated.roll))}`;
+  }
+
+  document.getElementById("startBtn").addEventListener("click", startTracking);
+  document.getElementById("stopBtn").addEventListener("click", stopTracking);
+})();
+</script>
+</body>
+</html>
