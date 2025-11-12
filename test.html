@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>3D Gyro Tracker — Phone Simulator</title>
+<style>
+  body { margin:0; font-family:system-ui,Segoe UI,Roboto,Arial; background:#111; color:#eee; }
+  #ui {
+    position: fixed; left: 12px; top: 12px; z-index: 999;
+    background: rgba(0,0,0,0.5); padding: 12px; border-radius: 10px;
+    backdrop-filter: blur(6px);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.6);
+  }
+  button { margin:4px; padding:8px 12px; border-radius:8px; border: none; cursor:pointer; font-weight:600;}
+  button.primary { background: #18a; color:#fff; }
+  button.warn { background:#d64; color:#fff; }
+  .small { font-size:13px; opacity:0.9; margin-top:6px; }
+  #log { margin-top:8px; font-family: monospace; font-size:12px; color:#bfe; }
+  #canvas { display:block; width:100vw; height:100vh; }
+  select, label { font-size:13px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div style="display:flex; gap:6px; align-items:center;">
+    <button id="btnStart" class="primary">Start</button>
+    <button id="btnStop">Stop</button>
+    <button id="btnRecord">Start Recording</button>
+    <button id="btnDownload" style="display:none">Download CSV</button>
+    <button id="btnPlay" style="display:none">Play</button>
+  </div>
+  <div class="small">Mode:
+    <select id="modeSelect">
+      <option value="orient">Use deviceorientation (angles)</option>
+      <option value="rates">Use rotationRate (devicemotion)</option>
+    </select>
+  </div>
+  <div id="log">
+    <div>Status: <span id="status">idle</span></div>
+    <div>Source: <span id="source">—</span></div>
+    <div>Angles α/β/γ: <span id="angles">— / — / —</span></div>
+    <div>rotationRate (deg/s): <span id="rates">— / — / —</span></div>
+    <div>Recorded rows: <span id="rows">0</span></div>
+  </div>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<!-- Three.js from CDN -->
+<script src="https://unpkg.com/three@0.150.1/build/three.min.js"></script>
+
+<script>
+/*
+  3D Gyroscope Tracker
+  - Visualizes phone (box) and applies device orientation
+  - Permission-aware (user gesture)
+  - Records data to CSV and allows playback
+*/
+
+(() => {
+  // UI elements
+  const btnStart = document.getElementById('btnStart');
+  const btnStop  = document.getElementById('btnStop');
+  const btnRecord = document.getElementById('btnRecord');
+  const btnDownload = document.getElementById('btnDownload');
+  const btnPlay = document.getElementById('btnPlay');
+  const statusEl = document.getElementById('status');
+  const sourceEl = document.getElementById('source');
+  const anglesEl = document.getElementById('angles');
+  const ratesEl = document.getElementById('rates');
+  const rowsEl = document.getElementById('rows');
+  const modeSelect = document.getElementById('modeSelect');
+
+  let running = false;
+  let recording = false;
+  let recorded = []; // array of {t, alpha,beta,gamma, rx,ry,rz}
+  let lastTs = null;
+
+  // THREE.js setup
+  const canvas = document.getElementById('canvas');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+  renderer.setClearColor(0x0b0b0f);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+  camera.position.set(0, 0, 6);
+
+  // lights
+  const light = new THREE.DirectionalLight(0xffffff, 1.0);
+  light.position.set(5, 10, 7);
+  scene.add(light);
+  scene.add(new THREE.AmbientLight(0x404040, 0.8));
+
+  // phone-like box
+  const phone = new THREE.Group();
+  const bodyGeom = new THREE.BoxGeometry(2.2, 4.6, 0.2);
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0x1e1e2a, metalness: 0.2, roughness: 0.6 });
+  const body = new THREE.Mesh(bodyGeom, bodyMat);
+  phone.add(body);
+
+  // screen inset
+  const screenGeom = new THREE.PlaneGeometry(1.9, 4.0);
+  const screenMat = new THREE.MeshStandardMaterial({ color: 0x0a0a12, emissive: 0x001133, emissiveIntensity: 0.08 });
+  const screen = new THREE.Mesh(screenGeom, screenMat);
+  screen.position.z = 0.101;
+  phone.add(screen);
+
+  // small camera bump
+  const camGeom = new THREE.CylinderGeometry(0.12,0.12,0.05,16);
+  const camMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+  const cam = new THREE.Mesh(camGeom, camMat);
+  cam.position.set(0.85, 2.05, 0.11);
+  cam.rotation.x = Math.PI/2;
+  phone.add(cam);
+
+  scene.add(phone);
+
+  // ground for reference
+  const grid = new THREE.GridHelper(30, 30, 0x222244, 0x151522);
+  grid.position.y = -6;
+  scene.add(grid);
+
+  // handle resize
+  function resize() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    renderer.setSize(w,h);
+    camera.aspect = w/h;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // helper: convert deviceorientation (alpha,beta,gamma) to quaternion for three.js
+  // Note: device orientation angles are in degrees: alpha (z), beta (x), gamma (y)
+  // Common conversion: use intrinsic 'Z-X'-Y order (but many variants exist). We'll use a robust conversion:
+  function eulerFromDevice(alpha, beta, gamma) {
+    // convert degrees -> radians
+    const _deg2rad = Math.PI / 180;
+    const a = (alpha || 0) * _deg2rad;
+    const b = (beta  || 0) * _deg2rad;
+    const g = (gamma || 0) * _deg2rad;
+
+    // Following the conventions used by many deviceorientation -> three.js adaptors:
+    // Create Euler in 'ZYX' order as needed and then apply adjustments:
+    const euler = new THREE.Euler();
+    // Many implementations use 'ZXY' — empirically this gives good mapping for portrait phone orientation.
+    euler.set(b, g, a, 'ZXY'); // set(x, y, z, order) but we place values as (beta,gamma,alpha) and order ZXY
+    return new THREE.Quaternion().setFromEuler(euler);
+  }
+
+  // For visual clarity: tilt phone so screen faces camera initially
+  phone.rotation.x = 0;
+  phone.rotation.y = 0;
+  phone.rotation.z = 0;
+
+  // animation loop
+  let replayIndex = 0, replayInterval = null;
+  function animate() {
+    requestAnimationFrame(animate);
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // Sensor handlers
+  function onDeviceOrientation(e) {
+    const ts = performance.now();
+    lastTs = ts;
+    const alpha = (typeof e.alpha === 'number') ? e.alpha : NaN;
+    const beta  = (typeof e.beta  === 'number') ? e.beta  : NaN;
+    const gamma = (typeof e.gamma === 'number') ? e.gamma : NaN;
+
+    // convert to quaternion and apply to phone
+    const q = eulerFromDevice(alpha, beta, gamma);
+    // NOTE: device coords vs three.js coords differ; adjust with one rotation to match expected orientation:
+    phone.quaternion.copy(q);
+
+    anglesEl.textContent = `${alpha.toFixed(2)} / ${beta.toFixed(2)} / ${gamma.toFixed(2)}`;
+
+    if (recording) {
+      recorded.push({
+        t: Date.now(),
+        alpha: isNaN(alpha) ? '' : alpha,
+        beta: isNaN(beta) ? '' : beta,
+        gamma: isNaN(gamma) ? '' : gamma,
+        rx: '', ry: '', rz: ''
+      });
+      rowsEl.textContent = recorded.length;
+    }
+  }
+
+  function onDeviceMotion(e) {
+    const ts = performance.now();
+    lastTs = ts;
+    const rr = e.rotationRate || {};
+    // rotationRate fields vary (alpha/beta/gamma) — usually in deg/s
+    const rx = typeof rr.alpha === 'number' ? rr.alpha : 0;
+    const ry = typeof rr.beta  === 'number' ? rr.beta  : 0;
+    const rz = typeof rr.gamma === 'number' ? rr.gamma : 0;
+
+    ratesEl.textContent = `${rx.toFixed(2)} / ${ry.toFixed(2)} / ${rz.toFixed(2)}`;
+
+    if (recording) {
+      recorded.push({
+        t: Date.now(),
+        alpha: '', beta: '', gamma: '',
+        rx, ry, rz
+      });
+      rowsEl.textContent = recorded.length;
+    }
+  }
+
+  // Permission request helpers (must be called on user gesture)
+  async function requestPermissions() {
+    // iOS/deviceMotion requires explicit permission
+    try {
+      if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+        const dm = await DeviceMotionEvent.requestPermission().catch(()=>'denied');
+        // also try DeviceOrientationEvent
+        const doPerm = (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function')
+          ? await DeviceOrientationEvent.requestPermission().catch(()=> 'denied')
+          : 'granted';
+        return (dm === 'granted' || doPerm === 'granted');
+      }
+    } catch (err) {
+      console.warn('Permission request error', err);
+    }
+    // Other platforms usually allow with user gesture or don't require explicit permission
+    return true;
+  }
+
+  // start/stop functions
+  async function startSensors() {
+    if (running) return;
+    statusEl.textContent = 'requesting perms...';
+    const ok = await requestPermissions();
+    if (!ok) {
+      statusEl.textContent = 'permission denied';
+      return;
+    }
+
+    // add handlers
+    window.addEventListener('deviceorientation', onDeviceOrientation, true);
+    window.addEventListener('devicemotion', onDeviceMotion, true);
+    running = true;
+    statusEl.textContent = 'running';
+    sourceEl.textContent = 'deviceorientation/devicemotion';
+  }
+
+  function stopSensors() {
+    if (!running) return;
+    window.removeEventListener('deviceorientation', onDeviceOrientation, true);
+    window.removeEventListener('devicemotion', onDeviceMotion, true);
+    running = false;
+    statusEl.textContent = 'stopped';
+    sourceEl.textContent = '—';
+  }
+
+  // Recording controls
+  btnRecord.addEventListener('click', () => {
+    if (!recording) {
+      recorded = [];
+      recording = true;
+      btnRecord.textContent = 'Stop Recording';
+      btnDownload.style.display = 'none';
+      rowsEl.textContent = '0';
+      statusEl.textContent = 'running (recording)';
+    } else {
+      recording = false;
+      btnRecord.textContent = 'Start Recording';
+      btnDownload.style.display = recorded.length ? 'inline-block' : 'none';
+      statusEl.textContent = 'running';
+    }
+  });
+
+  btnDownload.addEventListener('click', () => {
+    if (!recorded.length) return alert('No recorded data');
+    // unify fields (alpha,beta,gamma,rx,ry,rz) — create CSV
+    const header = ['timestamp','alpha','beta','gamma','rx','ry','rz'];
+    const lines = recorded.map(r => {
+      return [
+        new Date(r.t).toISOString(),
+        r.alpha !== undefined ? r.alpha : '',
+        r.beta  !== undefined ? r.beta  : '',
+        r.gamma !== undefined ? r.gamma : '',
+        r.rx !== undefined ? r.rx : '',
+        r.ry !== undefined ? r.ry : '',
+        r.rz !== undefined ? r.rz : ''
+      ].join(',');
+    });
+    const csv = [header.join(','), ...lines].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'gyro_recording_' + (new Date()).toISOString().replace(/[:.]/g,'-') + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  // Playback: step through recorded frames and apply to phone
+  btnPlay.addEventListener('click', () => {
+    if (!recorded.length) return alert('No recording to play');
+    // stop live sensors while replaying
+    const wasRunning = running;
+    stopSensors();
+
+    let i = 0;
+    btnPlay.disabled = true;
+    statusEl.textContent = 'replaying';
+    replayInterval = setInterval(() => {
+      if (i >= recorded.length) {
+        clearInterval(replayInterval);
+        btnPlay.disabled = false;
+        statusEl.textContent = wasRunning ? 'running' : 'stopped';
+        if (wasRunning) startSensors(); // resume real sensors if they were running
+        return;
+      }
+      const r = recorded[i++];
+      // apply whichever data available
+      if (r.alpha !== '' && r.alpha !== undefined) {
+        const q = (function(){ const THREEQ = THREE; return (function(a,b,g){ const e=new THREEQ.Euler(); e.set((b||0)*Math.PI/180,(g||0)*Math.PI/180,(a||0)*Math.PI/180,'ZXY'); return new THREEQ.Quaternion().setFromEuler(e); })(r.alpha, r.beta, r.gamma); })();
+        phone.quaternion.copy(q);
+      } else if (r.rx !== '' && r.rx !== undefined) {
+        // For simple playback using rotation rates we won't integrate here; skip
+      }
+    }, 30);
+  });
+
+  // Start/Stop UI
+  btnStart.addEventListener('click', startSensors);
+  btnStop.addEventListener('click', stopSensors);
+
+  // small UX: if recording exists, show download / play
+  const obs = new MutationObserver(() => {
+    btnDownload.style.display = recorded.length ? 'inline-block' : 'none';
+    btnPlay.style.display = recorded.length ? 'inline-block' : 'none';
+  });
+  obs.observe(rowsEl, { childList: true, subtree: true });
+
+  // Inform user about permissions when page loads
+  (function detectSupport() {
+    const hasDO = typeof DeviceOrientationEvent !== 'undefined';
+    const hasDM = typeof DeviceMotionEvent !== 'undefined';
+    if (!hasDO && !hasDM) {
+      statusEl.textContent = 'no orientation/motion support on this device/browser';
+    } else {
+      statusEl.textContent = 'idle — press Start (permission required on some devices)';
+    }
+  })();
+
+  // prevent accidental scrolling while interacting (optional)
+  // document.addEventListener('touchmove', e => { if (running) e.preventDefault(); }, { passive: false });
+
+})();
+</script>
+</body>
+</html>
